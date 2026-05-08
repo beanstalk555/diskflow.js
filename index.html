@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hass-Scott Disk Flow Prototype</title>
+  <style>
+    :root {
+      --bg: #d9d9dc;
+      --panel: #c8c8cb;
+      --btn: #efefef;
+      --btn-border: #7a7a7a;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      font-family: sans-serif;
+      color: #111;
+    }
+
+    .app {
+      width: 1000px;
+      max-width: calc(100vw - 24px);
+      margin: 10px auto;
+      border: 1px solid #bbb;
+      background: var(--bg);
+    }
+
+    .toolbar, .footer {
+      background: var(--panel);
+      padding: 8px 10px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 10px;
+      user-select: none;
+    }
+	
+	.credit {
+	  margin: 10px 14px 6px;
+	  font-size: 13px;
+	  color: #333;
+	  text-align: center;
+	}
+	.credit a {
+	  color: #1a4ea1;
+	  text-decoration: underline;
+	}
+
+    button {
+      background: var(--btn);
+      border: 1px solid var(--btn-border);
+      padding: 4px 10px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover { background: #fff; }
+
+    .traceLabel {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 540px;
+      background: var(--bg);
+      cursor: crosshair;
+      touch-action: none; /* critical for mobile drawing */
+    }
+
+    .radios {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 16px;
+    }
+    .radios label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* Mobile-friendly controls */
+    @media (max-width: 720px) {
+      .toolbar, .footer {
+        gap: 8px;
+        padding: 10px;
+        flex-wrap: wrap;
+      }
+      button {
+        font-size: 16px;
+        padding: 8px 12px;
+      }
+      .traceLabel, .radios label {
+        font-size: 16px;
+      }
+      canvas {
+        height: 62vh;
+        min-height: 360px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="toolbar">
+      <button id="clearBtn">clear</button>
+      <button id="completeBtn">complete</button>
+      <button id="runBtn">start disk flow</button>
+      <label class="traceLabel">
+        <input type="checkbox" id="traceToggle" checked />
+        leave a trace
+      </label>
+    </div>
+
+    <canvas id="canvas"></canvas>
+	
+	<p class="credit">
+	  This is a javascript port of a Java applet by Richard Vaughn and Joel Hass which demonstrates the curve shortening flow of Hass-Scott.
+	  <a href="https://www.math.ucdavis.edu/~hass/Research/DiskFlow/flow.html" target="_blank" rel="noopener noreferrer">
+		Original page
+	  </a>.
+	</p>
+
+    <div class="footer">
+      <div class="radios">
+        <label><input type="radio" name="res" value="fine" checked />fine</label>
+        <label><input type="radio" name="res" value="medium" />medium</label>
+        <label><input type="radio" name="res" value="coarse" />coarse</label>
+        <label><input type="radio" name="res" value="super" />super coarse</label>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const clearBtn = document.getElementById("clearBtn");
+    const completeBtn = document.getElementById("completeBtn");
+    const runBtn = document.getElementById("runBtn");
+    const traceToggle = document.getElementById("traceToggle");
+    const resRadios = [...document.querySelectorAll('input[name="res"]')];
+
+    const EPS = 1e-9;
+    const STEP_MS = 30;
+    const SAMPLE_MIN_DIST_MOUSE = 2.2;
+    const SAMPLE_MIN_DIST_TOUCH = 3.5;
+
+    const cellSizeMap = { fine: 8, medium: 16, coarse: 32, super: 64 };
+
+    let gridMode = "fine";
+    let s = cellSizeMap[gridMode];
+    let ox = 0;
+    let oy = 0;
+
+    let drawing = false;
+    let running = false;
+    let activePointerId = null;
+    let activePointerType = "mouse";
+
+    // Curve stored as closed loop without duplicating first point at end.
+    let currentCurve = [];
+    let history = [];
+
+    // ---------- HiDPI / responsive canvas ----------
+    function resizeCanvas() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const cssWidth = canvas.clientWidth;
+      const cssHeight = canvas.clientHeight;
+
+      const targetW = Math.round(cssWidth * dpr);
+      const targetH = Math.round(cssHeight * dpr);
+
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+
+      // Reset transform then map drawing units to CSS pixels
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      render();
+    }
+
+    function clearCanvas() {
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#d9d9dc";
+      ctx.fillRect(0, 0, w, h);
+    }
+
+    function dist2(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return dx * dx + dy * dy;
+    }
+
+    function lerp(a, b, t) {
+      return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    }
+
+    function hueColor(i) {
+      return `hsl(${(i * 7) % 360} 100% 50%)`;
+    }
+
+    function getPointerPos(e) {
+      const r = canvas.getBoundingClientRect();
+      return {
+        x: e.clientX - r.left,
+        y: e.clientY - r.top
+      };
+    }
+
+    function drawCurve(curve, color = "#222", width = 2) {
+      if (!curve || curve.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(curve[0].x, curve[0].y);
+      for (let i = 1; i < curve.length; i++) ctx.lineTo(curve[i].x, curve[i].y);
+      ctx.closePath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.stroke();
+    }
+
+    function dedupConsecutive(points, eps = 1e-6) {
+      if (points.length === 0) return points;
+      const out = [points[0]];
+      for (let i = 1; i < points.length; i++) {
+        if (Math.hypot(points[i].x - out[out.length - 1].x, points[i].y - out[out.length - 1].y) > eps) {
+          out.push(points[i]);
+        }
+      }
+      if (out.length > 1) {
+        const a = out[0], b = out[out.length - 1];
+        if (Math.hypot(a.x - b.x, a.y - b.y) < eps) out.pop();
+      }
+      return out;
+    }
+
+    function simplifyByDistance(points, minDist = 1.5) {
+      if (points.length < 3) return points.slice();
+      const md2 = minDist * minDist;
+      const out = [points[0]];
+      for (let i = 1; i < points.length; i++) {
+        if (dist2(points[i], out[out.length - 1]) >= md2) out.push(points[i]);
+      }
+      return dedupConsecutive(out);
+    }
+
+    function resampleClosed(points, step = 3) {
+      if (points.length < 2) return points.slice();
+      const n = points.length;
+      const out = [points[0]];
+      let carry = 0;
+
+      for (let i = 0; i < n; i++) {
+        const a = points[i];
+        const b = points[(i + 1) % n];
+        const len = Math.hypot(b.x - a.x, b.y - a.y);
+        if (len < EPS) continue;
+
+        let t0 = 0;
+        while (carry + len * (1 - t0) >= step) {
+          const need = (step - carry) / len;
+          const t = t0 + need;
+          out.push(lerp(a, b, t));
+          t0 = t;
+          carry = 0;
+        }
+        carry += len * (1 - t0);
+      }
+
+      return dedupConsecutive(out);
+    }
+
+    function cellIdAt(x, y, size, ox, oy) {
+      const cx = Math.floor((x - ox) / size);
+      const cy = Math.floor((y - oy) / size);
+      return `${cx},${cy}`;
+    }
+
+    function segmentIntersectionsWithGrid(A, B, size, ox, oy) {
+      const dx = B.x - A.x;
+      const dy = B.y - A.y;
+      const ts = [0, 1];
+
+      if (Math.abs(dx) > EPS) {
+        const minX = Math.min(A.x, B.x);
+        const maxX = Math.max(A.x, B.x);
+        const k0 = Math.ceil((minX - ox) / size);
+        const k1 = Math.floor((maxX - ox) / size);
+        for (let k = k0; k <= k1; k++) {
+          const xg = ox + k * size;
+          const t = (xg - A.x) / dx;
+          if (t > EPS && t < 1 - EPS) ts.push(t);
+        }
+      }
+
+      if (Math.abs(dy) > EPS) {
+        const minY = Math.min(A.y, B.y);
+        const maxY = Math.max(A.y, B.y);
+        const k0 = Math.ceil((minY - oy) / size);
+        const k1 = Math.floor((maxY - oy) / size);
+        for (let k = k0; k <= k1; k++) {
+          const yg = oy + k * size;
+          const t = (yg - A.y) / dy;
+          if (t > EPS && t < 1 - EPS) ts.push(t);
+        }
+      }
+
+      ts.sort((a, b) => a - b);
+
+      const out = [];
+      for (const t of ts) {
+        if (!out.length || Math.abs(t - out[out.length - 1]) > 1e-7) out.push(t);
+      }
+      return out;
+    }
+
+    // Exact-ish reconstruction by cell-run replacement:
+    // split segments at grid crossings, classify each atomic piece by cell midpoint,
+    // merge contiguous atomic pieces in same cell, replace each merged run by chord.
+    function iterateDiskFlowExact(curve, size, ox, oy) {
+      if (!curve || curve.length < 3) return curve.slice();
+      const n = curve.length;
+      const pieces = [];
+
+      for (let i = 0; i < n; i++) {
+        const A = curve[i];
+        const B = curve[(i + 1) % n];
+        const ts = segmentIntersectionsWithGrid(A, B, size, ox, oy);
+
+        for (let j = 0; j < ts.length - 1; j++) {
+          const t0 = ts[j], t1 = ts[j + 1];
+          if (t1 - t0 < 1e-10) continue;
+
+          const p0 = lerp(A, B, t0);
+          const p1 = lerp(A, B, t1);
+          const pm = lerp(A, B, (t0 + t1) * 0.5);
+          const cellId = cellIdAt(pm.x, pm.y, size, ox, oy);
+
+          pieces.push({ cellId, start: p0, end: p1 });
+        }
+      }
+
+      if (!pieces.length) return curve.slice();
+
+      const runs = [];
+      let run = { cellId: pieces[0].cellId, start: pieces[0].start, end: pieces[0].end };
+
+      for (let i = 1; i < pieces.length; i++) {
+        const p = pieces[i];
+        if (p.cellId === run.cellId) {
+          run.end = p.end;
+        } else {
+          runs.push(run);
+          run = { cellId: p.cellId, start: p.start, end: p.end };
+        }
+      }
+      runs.push(run);
+
+      // close-the-loop merge
+      if (runs.length > 1 && runs[0].cellId === runs[runs.length - 1].cellId) {
+        runs[0] = { cellId: runs[0].cellId, start: runs[runs.length - 1].start, end: runs[0].end };
+        runs.pop();
+      }
+
+      const out = [];
+      out.push(runs[0].start);
+      for (const r of runs) out.push(r.end);
+
+      let cleaned = dedupConsecutive(out, 1e-6);
+      cleaned = simplifyByDistance(cleaned, 0.8);
+      cleaned = resampleClosed(cleaned, 2.4);
+
+      return cleaned;
+    }
+
+    function render() {
+      clearCanvas();
+
+      if (traceToggle.checked) {
+        for (let i = 0; i < history.length; i++) drawCurve(history[i], hueColor(i), 2.0);
+        drawCurve(currentCurve, hueColor(history.length), 2.0);
+      } else {
+        drawCurve(currentCurve, "#222", 2.0);
+      }
+
+      if (drawing) drawCurve(currentCurve, "#222", 2.0);
+    }
+
+    function stepFlow() {
+      if (!running || currentCurve.length < 3) return;
+
+      if (traceToggle.checked) {
+        history.push(currentCurve.map(p => ({ x: p.x, y: p.y })));
+        if (history.length > 240) history.shift();
+      } else {
+        history.length = 0;
+      }
+
+      currentCurve = iterateDiskFlowExact(currentCurve, s, ox, oy);
+
+      ox = (ox + s / 3) % s;
+      oy = (oy + s / 3) % s;
+
+      render();
+    }
+
+    function finishDrawingAndAutoClose() {
+      drawing = false;
+      if (currentCurve.length > 2) {
+        currentCurve = simplifyByDistance(currentCurve, 1.4);
+        currentCurve = dedupConsecutive(currentCurve);
+        currentCurve = resampleClosed(currentCurve, 3.0); // auto-close behavior
+      }
+      render();
+    }
+
+    // ---------- Pointer events (mouse + touch + pen) ----------
+    canvas.addEventListener("pointerdown", (e) => {
+      // ignore secondary pointers; single-stroke model
+      if (activePointerId !== null) return;
+
+      activePointerId = e.pointerId;
+      activePointerType = e.pointerType || "mouse";
+      canvas.setPointerCapture(activePointerId);
+
+      e.preventDefault();
+
+      running = false;
+      runBtn.textContent = "start disk flow";
+      history.length = 0;
+
+      drawing = true;
+      const p = getPointerPos(e);
+      currentCurve = [p];
+      render();
+    });
+
+    canvas.addEventListener("pointermove", (e) => {
+      if (!drawing) return;
+      if (e.pointerId !== activePointerId) return;
+
+      e.preventDefault();
+
+      const p = getPointerPos(e);
+      const last = currentCurve[currentCurve.length - 1];
+      const minDist = (activePointerType === "touch") ? SAMPLE_MIN_DIST_TOUCH : SAMPLE_MIN_DIST_MOUSE;
+
+      if (!last || dist2(last, p) > minDist * minDist) {
+        currentCurve.push(p);
+        render();
+      }
+    });
+
+    function endPointer(e) {
+      if (activePointerId === null) return;
+      if (e.pointerId !== activePointerId) return;
+
+      e.preventDefault();
+
+      try { canvas.releasePointerCapture(activePointerId); } catch (_) {}
+      activePointerId = null;
+      activePointerType = "mouse";
+
+      finishDrawingAndAutoClose();
+    }
+
+    canvas.addEventListener("pointerup", endPointer);
+    canvas.addEventListener("pointercancel", endPointer);
+    canvas.addEventListener("lostpointercapture", (e) => {
+      if (e.pointerId === activePointerId) {
+        activePointerId = null;
+        activePointerType = "mouse";
+        if (drawing) finishDrawingAndAutoClose();
+      }
+    });
+
+    clearBtn.addEventListener("click", () => {
+      running = false;
+      runBtn.textContent = "start disk flow";
+      drawing = false;
+      activePointerId = null;
+      currentCurve = [];
+      history = [];
+      ox = 0;
+      oy = 0;
+      render();
+    });
+
+    completeBtn.addEventListener("click", () => {
+      if (currentCurve.length > 2) {
+        currentCurve = resampleClosed(dedupConsecutive(currentCurve), 2.8);
+        render();
+      }
+    });
+
+    runBtn.addEventListener("click", () => {
+      if (currentCurve.length < 3) return;
+      running = !running;
+      runBtn.textContent = running ? "stop disk flow" : "start disk flow";
+    });
+
+    traceToggle.addEventListener("change", () => {
+      if (!traceToggle.checked) history.length = 0;
+      render();
+    });
+
+    for (const r of resRadios) {
+      r.addEventListener("change", () => {
+        if (!r.checked) return;
+        gridMode = r.value;
+        s = cellSizeMap[gridMode];
+      });
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+
+    let last = performance.now();
+    function animate(now) {
+      if (running && now - last >= STEP_MS) {
+        stepFlow();
+        last = now;
+      }
+      requestAnimationFrame(animate);
+    }
+
+    resizeCanvas();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
