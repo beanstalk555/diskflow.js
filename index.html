@@ -64,6 +64,31 @@
       gap: 6px;
       font-size: 14px;
     }
+    .doublePointBox {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-sizing: border-box;
+      background: var(--btn);
+      border: 1px solid var(--btn-border);
+      padding: 4px 10px;
+      font-size: 14px;
+      line-height: normal;
+    }
+    .doublePointTitle {
+      font-family: inherit;
+      font-size: inherit;
+      font-weight: normal;
+      color: #111;
+    }
+    .doublePointNum {
+      font-weight: bold;
+      font-size: inherit;
+      color: #111;
+      min-width: 1.25em;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
 
     canvas {
       display: block;
@@ -100,6 +125,10 @@
       .traceLabel, .radios label {
         font-size: 16px;
       }
+      .doublePointBox {
+        font-size: 16px;
+        padding: 8px 12px;
+      }
       canvas {
         height: 62vh;
         min-height: 360px;
@@ -117,6 +146,16 @@
         <input type="checkbox" id="traceToggle" checked />
         leave a trace
       </label>
+      <span class="doublePointBox">
+        <span class="doublePointTitle">Double-point count:</span>
+        <span class="doublePointNum" id="intersectionCounter">0</span>
+      </span>
+      <span id="debugGridOptionWrap">
+        <label class="traceLabel">
+          <input type="checkbox" id="debugOverlayToggle" />
+          debug grid
+        </label>
+      </span>
     </div>
 
     <canvas id="canvas"></canvas>
@@ -124,8 +163,7 @@
 	<p class="credit">
 	  This is a JavaScript port of a Java applet by Richard Vaughn and Joel Hass which demonstrates the curve shortening flow of Hass - Scott.
 	  <a href="https://www.math.ucdavis.edu/~hass/Research/DiskFlow/flow.html" target="_blank" rel="noopener noreferrer">
-		Original page
-	  </a>.
+		Original page</a>.
 	</p>
 
     <div class="footer">
@@ -139,6 +177,9 @@
   </div>
 
   <script>
+    /** Set to true to show the "debug grid" checkbox in the toolbar. */
+    const SHOW_DEBUG_GRID_OPTION = false;
+
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
 
@@ -146,6 +187,11 @@
     const resetBtn = document.getElementById("resetBtn");
     const runBtn = document.getElementById("runBtn");
     const traceToggle = document.getElementById("traceToggle");
+    const intersectionCounter = document.getElementById("intersectionCounter");
+
+    const debugGridOptionWrap = document.getElementById("debugGridOptionWrap");
+    if (!SHOW_DEBUG_GRID_OPTION && debugGridOptionWrap) debugGridOptionWrap.remove();
+    const debugOverlayToggle = document.getElementById("debugOverlayToggle");
     const resRadios = [...document.querySelectorAll('input[name="res"]')];
 
     const EPS = 1e-9;
@@ -329,6 +375,255 @@
       return `${cx},${cy}`;
     }
 
+    function cellCoordsFromId(cellId) {
+      const [cxStr, cyStr] = cellId.split(",");
+      return { cx: Number(cxStr), cy: Number(cyStr) };
+    }
+
+    /**
+     * Cyclic boundary parameter in [0, 4), CCW from bottom-left (BL).
+     * Canvas: cell (x0,y0) is top-left; v grows downward (bottom has v≈1).
+     */
+    function boundaryParamForCell(point, cell, size, ox, oy) {
+      const x0 = ox + cell.cx * size;
+      const y0 = oy + cell.cy * size;
+      const u = (point.x - x0) / size;
+      const v = (point.y - y0) / size;
+      const tol = 1e-7;
+
+      const onL = u <= tol;
+      const onR = u >= 1 - tol;
+      const onTop = v <= tol;
+      const onBottom = v >= 1 - tol;
+
+      if (!onL && !onR && !onTop && !onBottom) return null;
+
+      if (onBottom && onL) return 0;
+      if (onBottom && onR) return 1;
+      if (onTop && onR) return 2;
+      if (onTop && onL) return 3;
+
+      if (onBottom && !onL && !onR) return u;
+      if (onR && !onTop && !onBottom) return 1 + v;
+      if (onTop && !onL && !onR) return 2 + (1 - u);
+      if (onL && !onTop && !onBottom) return 3 + (1 - v);
+
+      return null;
+    }
+
+    /** Proper intersection (interiors cross); excludes parallel/collinear overlap. */
+    function segmentsIntersectProper(a, b, c, d) {
+      const o = (p, q, r) =>
+        (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+      const tol = 1e-10;
+      const o1 = o(a, b, c);
+      const o2 = o(a, b, d);
+      const o3 = o(c, d, a);
+      const o4 = o(c, d, b);
+      if (Math.abs(o1) < tol && Math.abs(o2) < tol) return false;
+      if (Math.abs(o3) < tol && Math.abs(o4) < tol) return false;
+      const s1 = o1 > tol ? 1 : o1 < -tol ? -1 : 0;
+      const s2 = o2 > tol ? 1 : o2 < -tol ? -1 : 0;
+      const s3 = o3 > tol ? 1 : o3 < -tol ? -1 : 0;
+      const s4 = o4 > tol ? 1 : o4 < -tol ? -1 : 0;
+      if (s1 === 0 || s2 === 0 || s3 === 0 || s4 === 0) return false;
+      return s1 * s2 < 0 && s3 * s4 < 0;
+    }
+
+    function analyzeCellStrands(strands, size, ox, oy) {
+      if (strands.length < 2) {
+        return { count: 0, crossings: [], sortedEndpoints: [], intervals: [] };
+      }
+      const cell = cellCoordsFromId(strands[0].cellId);
+
+      let count = 0;
+      const crossings = [];
+      for (let i = 0; i < strands.length; i++) {
+        for (let j = i + 1; j < strands.length; j++) {
+          const p = strands[i];
+          const q = strands[j];
+          if (segmentsIntersectProper(p.start, p.end, q.start, q.end)) {
+            count++;
+            crossings.push([i, j]);
+          }
+        }
+      }
+
+      const endpoints = [];
+      for (let pairId = 0; pairId < strands.length; pairId++) {
+        const strand = strands[pairId];
+        const tStart = boundaryParamForCell(strand.start, cell, size, ox, oy);
+        const tEnd = boundaryParamForCell(strand.end, cell, size, ox, oy);
+        if (tStart === null || tEnd === null) continue;
+        endpoints.push({ pairId, t: tStart, tie: tEnd, pt: strand.start });
+        endpoints.push({ pairId, t: tEnd, tie: tStart, pt: strand.end });
+      }
+      endpoints.sort((a, b) => {
+        if (a.t !== b.t) return a.t - b.t;
+        if (a.tie !== b.tie) return a.tie - b.tie;
+        return a.pairId - b.pairId;
+      });
+
+      const intervals = [];
+      const pairPositions = new Map();
+      for (let ord = 0; ord < endpoints.length; ord++) {
+        const e = endpoints[ord];
+        if (!pairPositions.has(e.pairId)) pairPositions.set(e.pairId, []);
+        pairPositions.get(e.pairId).push(ord);
+      }
+      for (const [pairId, positions] of pairPositions) {
+        if (positions.length !== 2) continue;
+        const lo = Math.min(positions[0], positions[1]);
+        const hi = Math.max(positions[0], positions[1]);
+        intervals.push({ lo, hi, pairId });
+      }
+
+      return { count, crossings, sortedEndpoints: endpoints, intervals };
+    }
+
+    function countCellIntersections(strands, size, ox, oy) {
+      return analyzeCellStrands(strands, size, ox, oy).count;
+    }
+
+    function buildStrandsByCell(curveSet, size, ox, oy) {
+      const byCell = new Map();
+      if (!curveSet.length) return byCell;
+      for (const curve of curveSet) {
+        if (!curve || curve.length < 3) continue;
+        for (let i = 0; i < curve.length; i++) {
+          const A = curve[i];
+          const B = curve[(i + 1) % curve.length];
+          const ts = segmentIntersectionsWithGrid(A, B, size, ox, oy);
+          for (let j = 0; j < ts.length - 1; j++) {
+            const t0 = ts[j], t1 = ts[j + 1];
+            if (t1 - t0 < 1e-10) continue;
+            const start = lerp(A, B, t0);
+            const end = lerp(A, B, t1);
+            const pm = lerp(A, B, (t0 + t1) * 0.5);
+            const cellId = cellIdAt(pm.x, pm.y, size, ox, oy);
+            if (!byCell.has(cellId)) byCell.set(cellId, []);
+            byCell.get(cellId).push({ cellId, start, end });
+          }
+        }
+      }
+      return byCell;
+    }
+
+    let lastIntersectionDebug = { total: 0, byCell: new Map(), cellAnalysis: new Map() };
+
+    function pairHue(pairId) {
+      return `hsl(${(pairId * 37) % 360} 72% 42%)`;
+    }
+
+    function updateIntersectionCounter() {
+      const byCell = buildStrandsByCell(curves, s, ox, oy);
+      let total = 0;
+      const cellAnalysis = new Map();
+      for (const [cellId, strands] of byCell) {
+        const a = analyzeCellStrands(strands, s, ox, oy);
+        total += a.count;
+        cellAnalysis.set(cellId, a);
+      }
+      lastIntersectionDebug = { total, byCell, cellAnalysis };
+      intersectionCounter.textContent = String(total);
+    }
+
+    function drawDebugOverlay() {
+      if (!debugOverlayToggle || !debugOverlayToggle.checked) return;
+      const data = lastIntersectionDebug;
+      if (!data || !data.byCell) return;
+
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+
+      ctx.save();
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = "rgba(90, 90, 110, 0.18)";
+      ctx.lineWidth = 1;
+      const xStart = ((ox % s) + s) % s;
+      const yStart = ((oy % s) + s) % s;
+      for (let x = xStart; x <= w; x += s) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+      for (let y = yStart; y <= h; y += s) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+
+      ctx.font = "10px sans-serif";
+      ctx.textBaseline = "middle";
+
+      for (const [cellId, strands] of data.byCell) {
+        const analysis = data.cellAnalysis.get(cellId);
+        const cell = cellCoordsFromId(cellId);
+        const x0 = ox + cell.cx * s;
+        const y0 = oy + cell.cy * s;
+
+        if (analysis && analysis.count > 0) {
+          ctx.strokeStyle = "rgba(200, 0, 160, 0.75)";
+          ctx.lineWidth = 2;
+        } else if (strands.length >= 2) {
+          ctx.strokeStyle = "rgba(0, 100, 200, 0.45)";
+          ctx.lineWidth = 1;
+        } else {
+          ctx.strokeStyle = "rgba(120, 120, 140, 0.25)";
+          ctx.lineWidth = 1;
+        }
+        ctx.strokeRect(x0 + 0.5, y0 + 0.5, s - 1, s - 1);
+
+        for (let idx = 0; idx < strands.length; idx++) {
+          const strand = strands[idx];
+          ctx.strokeStyle = pairHue(idx);
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(strand.start.x, strand.start.y);
+          ctx.lineTo(strand.end.x, strand.end.y);
+          ctx.stroke();
+        }
+
+        if (analysis && analysis.sortedEndpoints.length) {
+          analysis.sortedEndpoints.forEach((ep, ord) => {
+            ctx.fillStyle = pairHue(ep.pairId);
+            ctx.beginPath();
+            ctx.arc(ep.pt.x, ep.pt.y, 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 9px sans-serif";
+            ctx.fillText(String(ord), ep.pt.x - 3, ep.pt.y);
+          });
+        }
+
+        if (analysis && analysis.crossings.length) {
+          const cxMid = x0 + s * 0.5;
+          const cyMid = y0 + s * 0.5;
+          ctx.fillStyle = "rgba(180, 0, 140, 0.95)";
+          ctx.font = "9px sans-serif";
+          const txt = analysis.crossings.map(([a, b]) => `${a}×${b}`).join(" ");
+          ctx.fillText(txt, x0 + 4, y0 + 12);
+        }
+
+        ctx.fillStyle = "rgba(40, 40, 50, 0.85)";
+        ctx.font = "8px monospace";
+        ctx.fillText(cellId, x0 + 4, y0 + s - 6);
+      }
+
+      ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
+      ctx.font = "11px sans-serif";
+      ctx.fillText(
+        `grid s=${s} ox=${ox.toFixed(2)} oy=${oy.toFixed(2)}  strand-cells=${data.byCell.size}  total=${data.total}`,
+        8,
+        14
+      );
+
+      ctx.restore();
+    }
+
     function segmentIntersectionsWithGrid(A, B, size, ox, oy) {
       const dx = B.x - A.x;
       const dy = B.y - A.y;
@@ -427,6 +722,7 @@
     }
 
     function render() {
+      updateIntersectionCounter();
       clearCanvas();
 
       if (traceToggle.checked) {
@@ -439,6 +735,8 @@
       }
 
       if (drawing) drawCurve(drawingCurve, "#222", 2.0);
+
+      drawDebugOverlay();
     }
 
     function stepFlow() {
@@ -581,11 +879,18 @@
       render();
     });
 
+    if (debugOverlayToggle) {
+      debugOverlayToggle.addEventListener("change", () => {
+        render();
+      });
+    }
+
     for (const r of resRadios) {
       r.addEventListener("change", () => {
         if (!r.checked) return;
         gridMode = r.value;
         s = cellSizeMap[gridMode];
+        render();
       });
     }
 
@@ -602,6 +907,7 @@
 
     resizeCanvas();
     initTraceCanvas(false);
+    updateIntersectionCounter();
     requestAnimationFrame(animate);
   </script>
 </body>
