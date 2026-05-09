@@ -111,7 +111,7 @@
   <div class="app">
     <div class="toolbar">
       <button id="clearBtn">clear</button>
-      <button id="completeBtn">complete</button>
+      <button id="resetBtn">reset</button>
       <button id="runBtn">start disk flow</button>
       <label class="traceLabel">
         <input type="checkbox" id="traceToggle" checked />
@@ -122,7 +122,7 @@
     <canvas id="canvas"></canvas>
 	
 	<p class="credit">
-	  This is a javascript port of a Java applet by Richard Vaughn and Joel Hass which demonstrates the curve shortening flow of Hass-Scott.
+	  This is a JavaScript port of a Java applet by Richard Vaughn and Joel Hass which demonstrates the curve shortening flow of Hass - Scott.
 	  <a href="https://www.math.ucdavis.edu/~hass/Research/DiskFlow/flow.html" target="_blank" rel="noopener noreferrer">
 		Original page
 	  </a>.
@@ -143,7 +143,7 @@
     const ctx = canvas.getContext("2d");
 
     const clearBtn = document.getElementById("clearBtn");
-    const completeBtn = document.getElementById("completeBtn");
+    const resetBtn = document.getElementById("resetBtn");
     const runBtn = document.getElementById("runBtn");
     const traceToggle = document.getElementById("traceToggle");
     const resRadios = [...document.querySelectorAll('input[name="res"]')];
@@ -165,9 +165,13 @@
     let activePointerId = null;
     let activePointerType = "mouse";
 
-    // Curve stored as closed loop without duplicating first point at end.
-    let currentCurve = [];
-    let history = [];
+    // Curves stored as closed loops without duplicating first point at end.
+    let curves = [];
+    let initialCurves = [];
+    let drawingCurve = [];
+    let traceStepCount = 0;
+    let traceCanvas = document.createElement("canvas");
+    let traceCtx = traceCanvas.getContext("2d");
 
     // ---------- HiDPI / responsive canvas ----------
     function resizeCanvas() {
@@ -185,6 +189,7 @@
 
       // Reset transform then map drawing units to CSS pixels
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      initTraceCanvas(true);
       render();
     }
 
@@ -194,6 +199,29 @@
       ctx.clearRect(0, 0, w, h);
       ctx.fillStyle = "#d9d9dc";
       ctx.fillRect(0, 0, w, h);
+    }
+
+    function initTraceCanvas(preserveExisting = false) {
+      const prevTrace = traceCanvas;
+      const prevWidth = prevTrace.width;
+      const prevHeight = prevTrace.height;
+
+      traceCanvas = document.createElement("canvas");
+      traceCanvas.width = canvas.width;
+      traceCanvas.height = canvas.height;
+      traceCtx = traceCanvas.getContext("2d");
+
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      traceCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      traceCtx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      if (preserveExisting && traceStepCount > 0 && prevWidth > 0 && prevHeight > 0) {
+        traceCtx.drawImage(prevTrace, 0, 0, prevWidth, prevHeight, 0, 0, canvas.clientWidth, canvas.clientHeight);
+      }
+    }
+
+    function clearTraceCanvas() {
+      traceStepCount = 0;
+      initTraceCanvas(false);
     }
 
     function dist2(a, b) {
@@ -217,15 +245,31 @@
       };
     }
 
-    function drawCurve(curve, color = "#222", width = 2) {
+    function cloneCurve(curve) {
+      return curve.map(p => ({ x: p.x, y: p.y }));
+    }
+
+    function cloneCurves(curveSet) {
+      return curveSet.map(cloneCurve);
+    }
+
+    function drawCurveOn(targetCtx, curve, color = "#222", width = 2) {
       if (!curve || curve.length < 2) return;
-      ctx.beginPath();
-      ctx.moveTo(curve[0].x, curve[0].y);
-      for (let i = 1; i < curve.length; i++) ctx.lineTo(curve[i].x, curve[i].y);
-      ctx.closePath();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = width;
-      ctx.stroke();
+      targetCtx.beginPath();
+      targetCtx.moveTo(curve[0].x, curve[0].y);
+      for (let i = 1; i < curve.length; i++) targetCtx.lineTo(curve[i].x, curve[i].y);
+      targetCtx.closePath();
+      targetCtx.strokeStyle = color;
+      targetCtx.lineWidth = width;
+      targetCtx.stroke();
+    }
+
+    function drawCurve(curve, color = "#222", width = 2) {
+      drawCurveOn(ctx, curve, color, width);
+    }
+
+    function drawCurves(curveSet, color = "#222", width = 2) {
+      for (const curve of curveSet) drawCurve(curve, color, width);
     }
 
     function dedupConsecutive(points, eps = 1e-6) {
@@ -386,26 +430,33 @@
       clearCanvas();
 
       if (traceToggle.checked) {
-        for (let i = 0; i < history.length; i++) drawCurve(history[i], hueColor(i), 2.0);
-        drawCurve(currentCurve, hueColor(history.length), 2.0);
+        if (traceStepCount > 0) {
+          ctx.drawImage(traceCanvas, 0, 0, canvas.clientWidth, canvas.clientHeight);
+        }
+        drawCurves(curves, hueColor(traceStepCount), 2.0);
       } else {
-        drawCurve(currentCurve, "#222", 2.0);
+        drawCurves(curves, "#222", 2.0);
       }
 
-      if (drawing) drawCurve(currentCurve, "#222", 2.0);
+      if (drawing) drawCurve(drawingCurve, "#222", 2.0);
     }
 
     function stepFlow() {
-      if (!running || currentCurve.length < 3) return;
+      if (!running || curves.length === 0) return;
 
       if (traceToggle.checked) {
-        history.push(currentCurve.map(p => ({ x: p.x, y: p.y })));
-        if (history.length > 240) history.shift();
-      } else {
-        history.length = 0;
+        const color = hueColor(traceStepCount);
+        for (const curve of curves) drawCurveOn(traceCtx, curve, color, 2.0);
+        traceStepCount++;
       }
 
-      currentCurve = iterateDiskFlowExact(currentCurve, s, ox, oy);
+      curves = curves
+        .map(curve => iterateDiskFlowExact(curve, s, ox, oy))
+        .filter(curve => curve.length >= 3);
+      if (curves.length === 0) {
+        running = false;
+        runBtn.textContent = "start disk flow";
+      }
 
       ox = (ox + s / 3) % s;
       oy = (oy + s / 3) % s;
@@ -415,11 +466,16 @@
 
     function finishDrawingAndAutoClose() {
       drawing = false;
-      if (currentCurve.length > 2) {
-        currentCurve = simplifyByDistance(currentCurve, 1.4);
-        currentCurve = dedupConsecutive(currentCurve);
-        currentCurve = resampleClosed(currentCurve, 3.0); // auto-close behavior
+      if (drawingCurve.length > 2) {
+        let closed = simplifyByDistance(drawingCurve, 1.4);
+        closed = dedupConsecutive(closed);
+        closed = resampleClosed(closed, 3.0); // auto-close behavior
+        if (closed.length > 2) {
+          curves.push(closed);
+          initialCurves = cloneCurves(curves);
+        }
       }
+      drawingCurve = [];
       render();
     }
 
@@ -436,11 +492,11 @@
 
       running = false;
       runBtn.textContent = "start disk flow";
-      history.length = 0;
+      clearTraceCanvas();
 
       drawing = true;
       const p = getPointerPos(e);
-      currentCurve = [p];
+      drawingCurve = [p];
       render();
     });
 
@@ -451,11 +507,11 @@
       e.preventDefault();
 
       const p = getPointerPos(e);
-      const last = currentCurve[currentCurve.length - 1];
+      const last = drawingCurve[drawingCurve.length - 1];
       const minDist = (activePointerType === "touch") ? SAMPLE_MIN_DIST_TOUCH : SAMPLE_MIN_DIST_MOUSE;
 
       if (!last || dist2(last, p) > minDist * minDist) {
-        currentCurve.push(p);
+        drawingCurve.push(p);
         render();
       }
     });
@@ -488,28 +544,40 @@
       runBtn.textContent = "start disk flow";
       drawing = false;
       activePointerId = null;
-      currentCurve = [];
-      history = [];
+      curves = [];
+      initialCurves = [];
+      drawingCurve = [];
+      clearTraceCanvas();
       ox = 0;
       oy = 0;
       render();
     });
 
-    completeBtn.addEventListener("click", () => {
-      if (currentCurve.length > 2) {
-        currentCurve = resampleClosed(dedupConsecutive(currentCurve), 2.8);
-        render();
-      }
+    resetBtn.addEventListener("click", () => {
+      if (initialCurves.length === 0) return;
+      running = false;
+      drawing = false;
+      activePointerId = null;
+      activePointerType = "mouse";
+      runBtn.textContent = "start disk flow";
+      curves = cloneCurves(initialCurves);
+      drawingCurve = [];
+      clearTraceCanvas();
+      ox = 0;
+      oy = 0;
+      render();
     });
 
     runBtn.addEventListener("click", () => {
-      if (currentCurve.length < 3) return;
+      if (curves.length === 0) return;
       running = !running;
       runBtn.textContent = running ? "stop disk flow" : "start disk flow";
     });
 
     traceToggle.addEventListener("change", () => {
-      if (!traceToggle.checked) history.length = 0;
+      if (!traceToggle.checked) {
+        clearTraceCanvas();
+      }
       render();
     });
 
@@ -533,6 +601,7 @@
     }
 
     resizeCanvas();
+    initTraceCanvas(false);
     requestAnimationFrame(animate);
   </script>
 </body>
